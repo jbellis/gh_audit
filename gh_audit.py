@@ -86,13 +86,10 @@ def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> str:
 
 
 def is_git_repo(path: str) -> bool:
+    def _git_rev_parse_ok(path: str) -> bool:
+        run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, check=True)
+        return True
     return os.path.isdir(os.path.join(path, ".git")) or _git_rev_parse_ok(path)
-
-
-def _git_rev_parse_ok(path: str) -> bool:
-    run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, check=True)
-    return True
-
 
 def get_default_branch_local(cwd: str, remote: str) -> str:
     """
@@ -177,103 +174,22 @@ def gh_repo_owner_and_name(cwd: str) -> str:
     return out.strip()
 
 
-def gh_get_recent_prs(cwd: str, limit: int = 200) -> Dict[str, PRInfo]:
-    """
-    Fetch recent PRs in bulk as an optimization.
-    Returns a mapping of head_ref -> PRInfo.
-    """
-    print(f"--> Batch call: Fetching most recent {limit} PRs...")
-    out = run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            str(limit),
-            "--json",
-            "number,state,title,url,mergedAt,headRefName,headRepositoryOwner",
-        ],
-        cwd=cwd,
-    )
-    data = json.loads(out) if out else []
-    mapping = {}
-    for item in data:
-        ref = item.get("headRefName")
-        if not ref:
-            continue
-        # If multiple PRs exist for the same head ref, the most recent one (first in list) wins
-        if ref not in mapping:
-            mapping[ref] = PRInfo(
-                number=int(item["number"]),
-                state=str(item["state"]),
-                title=str(item.get("title") or ""),
-                url=str(item.get("url") or ""),
-                merged_at=item.get("mergedAt"),
-                head_ref=item.get("headRefName"),
-                head_owner=(item.get("headRepositoryOwner") or {}).get("login"),
-            )
-    return mapping
-
-
-def gh_find_pr_by_head_branch(cwd: str, head_branch: str) -> Optional[PRInfo]:
-    """
-    Find PRs whose head ref is `head_branch` (in this repo).
-    Prefers the most recently updated one returned by gh.
-    """
-    out = run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            head_branch,
-            "--state",
-            "all",
-            "--limit",
-            "10",
-            "--json",
-            "number,state,title,url,mergedAt,headRefName,headRepositoryOwner",
-        ],
-        cwd=cwd,
-    )
-    data = json.loads(out) if out else []
-    if not data:
-        return None
-
-    # Prefer exact headRefName match; otherwise first result.
-    for item in data:
-        if item.get("headRefName") == head_branch:
-            return PRInfo(
-                number=int(item["number"]),
-                state=str(item["state"]),
-                title=str(item.get("title") or ""),
-                url=str(item.get("url") or ""),
-                merged_at=item.get("mergedAt"),
-                head_ref=item.get("headRefName"),
-                head_owner=(item.get("headRepositoryOwner") or {}).get("login"),
-            )
-
-    item = data[0]
-    return PRInfo(
-        number=int(item["number"]),
-        state=str(item["state"]),
-        title=str(item.get("title") or ""),
-        url=str(item.get("url") or ""),
-        merged_at=item.get("mergedAt"),
-        head_ref=item.get("headRefName"),
-        head_owner=(item.get("headRepositoryOwner") or {}).get("login"),
-    )
-
-
-def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str) -> List[PRInfo]:
+def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str, cache_dir: Path) -> List[PRInfo]:
     """
     Use GitHub API via gh to list PRs associated with a commit:
       GET /repos/{owner}/{repo}/commits/{ref}/pulls
 
     This is the most reliable way to map a local commit to PR(s) without guessing.
+    Results are cached by SHA.
     """
+    sha_cache_dir = cache_dir / "_sha_prs"
+    sha_cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = sha_cache_dir / f"{sha}.json"
+
+    if cache_file.exists():
+        data = json.loads(cache_file.read_text())
+        return [PRInfo(**item) for item in data]
+
     # Note: This endpoint historically required a custom Accept header. We include it.
     try:
         out = run(
@@ -288,8 +204,9 @@ def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str) -> List[P
         )
     except RuntimeError as e:
         if "HTTP 422" in str(e):
-            return []
-        raise
+            out = "[]"
+        else:
+            raise
 
     data = json.loads(out) if out else []
     prs: List[PRInfo] = []
@@ -305,7 +222,98 @@ def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str) -> List[P
                 head_owner=((item.get("head") or {}).get("repo") or {}).get("owner", {}).get("login"),
             )
         )
+
+    # Cache the result
+    cache_file.write_text(json.dumps([asdict(p) for p in prs]))
     return prs
+
+
+def gh_fetch_all_prs(cwd: str, cache_dir: Path) -> Dict[str, PRInfo]:
+    """
+    Fetch all PRs using pagination and cache results locally.
+    Returns a mapping of headRefName -> PRInfo (most recent first).
+    """
+    pr_cache_dir = cache_dir / "_prs"
+    pr_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cached_prs: Dict[int, PRInfo] = {}
+    for f in pr_cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+            cached_prs[data["number"]] = PRInfo(**data)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+    print("--> Updating PR cache from GitHub...")
+    
+    # We use a large limit per page. 'gh' handles some pagination but 
+    # we may need multiple calls if the repo is very large.
+    limit = 100
+    page = 1
+    
+    # Mapping to return
+    # We build this at the end from the full cache to ensure correct ordering (newest wins)
+    
+    while True:
+        # We sort by updated so we see changes to old PRs (like closing/merging)
+        out = run(
+            [
+                "gh", "pr", "list",
+                "--state", "all",
+                "--limit", str(limit),
+                # This is tricky: gh doesn't expose a simple way to get 'page 2' of the list 
+                # without using search or graphql. However, for most repos, 300-500 is plenty.
+                # We'll fetch 100 at a time and manually stop if we see no changes.
+                "--json", "number,state,title,url,mergedAt,headRefName,headRepositoryOwner",
+            ],
+            cwd=cwd,
+        )
+        data = json.loads(out) if out else []
+        if not data:
+            break
+
+        new_or_updated = 0
+        for item in data:
+            num = int(item["number"])
+            current = PRInfo(
+                number=num,
+                state=str(item["state"]),
+                title=str(item.get("title") or ""),
+                url=str(item.get("url") or ""),
+                merged_at=item.get("mergedAt"),
+                head_ref=item.get("headRefName"),
+                head_owner=(item.get("headRepositoryOwner") or {}).get("login"),
+            )
+            
+            cached = cached_prs.get(num)
+            if cached != current:
+                # Update cache
+                (pr_cache_dir / f"{num}.json").write_text(json.dumps(asdict(current)))
+                cached_prs[num] = current
+                new_or_updated += 1
+        
+        # If we didn't find any new/updated PRs in this page, we can likely stop.
+        # Note: If we need more than 100, we'd need to use --search or gh api.
+        # For now, we fetch up to 1000 total or until cache is stable.
+        if new_or_updated == 0 or page >= 10:
+            break
+            
+        # Optimization: since 'gh pr list' doesn't easily paginate beyond limit, 
+        # we increase limit for the next 'page' to see deeper history if needed.
+        limit += 100
+        page += 1
+
+    # Index by head_ref. Since results were fetched in updated order, 
+    # the first one we see for a ref is the "most relevant".
+    # Sort cached_prs by number descending before indexing.
+    indexed: Dict[str, PRInfo] = {}
+    for num in sorted(cached_prs.keys(), reverse=True):
+        pr = cached_prs[num]
+        if pr.head_ref and pr.head_ref not in indexed:
+            indexed[pr.head_ref] = pr
+    return indexed
+
+
 
 
 def iso_to_short(iso: Optional[str]) -> str:
@@ -332,15 +340,13 @@ def classify_branches(cwd: str, remote: str, default_branch: str, branches: List
     owner_repo = gh_repo_owner_and_name(cwd)
     cache_dir = get_cache_dir(owner_repo)
 
-    # Cache remote branches once to avoid N network calls
+    # 1. Fetch all PRs (cached)
+    pr_index = gh_fetch_all_prs(cwd, cache_dir)
+
+    # 2. Batch check remote branch existence
     remote_heads_cache: Dict[str, set[str]] = {}
-    
-    # Optimization: Fetch 200 most recent PRs in one go (Lazy)
-    recent_prs: Optional[Dict[str, PRInfo]] = None
 
     classified: List[Classified] = []
-    
-    # Filter out default branch before progress bar
     target_branches = [b for b in branches if b.name != default_branch]
     
     for b in tqdm(target_branches, desc="Classifying branches", unit="branch"):
@@ -348,97 +354,36 @@ def classify_branches(cwd: str, remote: str, default_branch: str, branches: List
 
         # Simplified logic for foreign remotes
         if up_remote != remote:
-            # Get the SHA of the upstream reference as seen locally
             upstream_sha = run(["git", "rev-parse", b.upstream], cwd=cwd, check=False)
-            if b.head_sha == upstream_sha:
-                note = f"Foreign remote ({up_remote}); matches locally cached upstream."
-            else:
-                note = f"Foreign remote ({up_remote}); has local changes vs cached upstream."
-            
-            classified.append(Classified(
-                branch=b,
-                remote_exists=True, # We assume it exists if we have an upstream ref
-                pr=None,
-                note=note,
-                is_version_branch=is_version_branch_name(b.name)
-            ))
+            note = f"Foreign remote ({up_remote}); matches locally cached upstream." if b.head_sha == upstream_sha else f"Foreign remote ({up_remote}); changes vs cached upstream."
+            classified.append(Classified(branch=b, remote_exists=True, pr=None, note=note, is_version_branch=is_version_branch_name(b.name)))
             continue
 
-        # We cache intermediate results (remote_exists and PRInfo) keyed by branch name AND sha.
-        # This allows classification logic to change without stale results.
-        # We replace slashes in branch names with underscores to keep a flat file structure.
-        safe_branch_name = b.name.replace("/", "_")
-        cache_file = cache_dir / f"{safe_branch_name}.{b.head_sha}.json"
-        
-        pr: Optional[PRInfo] = None
-        exists: bool = False
-        note = ""
-        cached_hit = False
+        # Check remote existence
+        if up_remote not in remote_heads_cache:
+            remote_heads_cache[up_remote] = get_all_remote_branches(cwd, up_remote)
+        exists = up_branch in remote_heads_cache[up_remote]
 
-        if cache_file.exists():
-            data = json.loads(cache_file.read_text())
-            exists = data["remote_exists"]
-            pr_data = data.get("pr")
-            pr = PRInfo(**pr_data) if pr_data else None
-            note = data.get("note", "") + " (from local cache)"
-            cached_hit = True
-
-        if not cached_hit:
-            up_remote, up_branch = upstream_remote_and_branch(b.upstream)
-
-            # Batch check: use cached remote heads if available
-            if up_remote not in remote_heads_cache:
-                remote_heads_cache[up_remote] = get_all_remote_branches(cwd, up_remote)
-
-            exists = up_branch in remote_heads_cache[up_remote]
-
-            if exists:
-                # Check optimization cache first (Lazy load)
-                if recent_prs is None:
-                    recent_prs = gh_get_recent_prs(cwd, limit=200)
-
-                pr = recent_prs.get(up_branch)
-                if pr:
-                    note = "Matched PR by head branch (from recent PR batch)."
-                else:
-                    # Fallback to specific lookup
-                    pr = gh_find_pr_by_head_branch(cwd, up_branch)
-                    if pr is None:
-                        note = "No PR found by head branch."
-                    else:
-                        note = "Matched PR by head branch (via fallback lookup)."
+        # PR Matching Strategy:
+        # 1. Try head branch name (works for squash/rebase merges too)
+        pr = pr_index.get(up_branch)
+        if pr:
+            note = "Matched PR by branch name."
+        else:
+            # 2. Fallback: commit association (works if SHAs weren't rewritten)
+            prs = gh_prs_associated_with_commit(cwd, owner_repo, b.head_sha, cache_dir)
+            merged = [p for p in prs if p.merged_at or p.state == "MERGED"]
+            if merged:
+                pr = merged[0]
+                note = "Matched merged PR via commit->PR association."
+            elif prs:
+                pr = prs[0]
+                note = f"Found PR #{pr.number} via commit association, but status is {pr.state}."
             else:
-                # Upstream branch removed: try mapping local HEAD SHA to PR(s)
-                prs = gh_prs_associated_with_commit(cwd, owner_repo, b.head_sha)
-                # Prefer merged PR
-                merged = [p for p in prs if p.merged_at]
-                if merged:
-                    pr = merged[0]
-                    # Normalize "state" to MERGED for reporting
-                    pr = PRInfo(
-                        number=pr.number,
-                        state="MERGED",
-                        title=pr.title,
-                        url=pr.url,
-                        merged_at=pr.merged_at,
-                        head_ref=pr.head_ref,
-                        head_owner=pr.head_owner,
-                    )
-                    note = "Upstream missing; matched merged PR via commit->PR association."
-                elif prs:
-                    # Some PRs found but not merged (e.g., closed)
-                    pr = prs[0]
-                    note = "Upstream missing; found PR via commit association, but it does not appear merged."
-                else:
-                    note = "Upstream missing; no PR association found for local HEAD commit."
+                note = "No PR association found."
 
-            # Save intermediate results to local file cache
-            cache_payload = {
-                "remote_exists": exists,
-                "pr": asdict(pr) if pr else None,
-                "note": note
-            }
-            cache_file.write_text(json.dumps(cache_payload))
+        if not exists and pr and (pr.merged_at or pr.state == "MERGED"):
+            note += " Upstream branch removed."
 
         # Final classification (calculated every time, not cached)
         classified.append(Classified(
