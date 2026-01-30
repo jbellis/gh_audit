@@ -34,7 +34,7 @@ from tqdm import tqdm
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -56,12 +56,29 @@ class PRInfo:
 
 
 @dataclass(frozen=True)
+class FuzzyMatch:
+    matched: int
+    total: int
+
+    @property
+    def ratio_str(self) -> str:
+        return f"{self.matched}/{self.total}"
+
+    @property
+    def match_percentage(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return (self.matched / self.total) * 100
+
+
+@dataclass(frozen=True)
 class Classified:
     branch: BranchInfo
     remote_exists: bool
     pr: Optional[PRInfo]
     note: str
     is_version_branch: bool = False
+    fuzzy_match: Optional[FuzzyMatch] = None
 
 
 def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> str:
@@ -85,41 +102,49 @@ def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> str:
     return p.stdout.strip()
 
 
-def is_git_repo(path: str) -> bool:
+def git_is_repo(path: str) -> bool:
     def _git_rev_parse_ok(path: str) -> bool:
         run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, check=True)
         return True
+
     return os.path.isdir(os.path.join(path, ".git")) or _git_rev_parse_ok(path)
 
-def get_default_branch_local(cwd: str, remote: str) -> str:
-    """
-    Determine default branch (local name) by asking origin/HEAD, falling back to remote show.
-    Returns something like "main" or "master".
-    """
-    # Try: refs/remotes/origin/HEAD -> origin/main
-    ref = run(["git", "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"], cwd=cwd, check=False)
-    if ref:
-        m = re.match(rf"^{re.escape(remote)}/(.+)$", ref)
+
+def git_parse_default_branch(
+    remote: str, symbolic_ref_out: str, remote_show_out: str
+) -> str:
+    """Pure function to determine default branch from git output."""
+    if symbolic_ref_out:
+        m = re.match(rf"^{re.escape(remote)}/(.+)$", symbolic_ref_out)
         if m:
             return m.group(1)
 
-    # Fallback: `git remote show origin` -> "HEAD branch: main"
-    out = run(["git", "remote", "show", remote], cwd=cwd, check=False)
-    for line in out.splitlines():
+    for line in remote_show_out.splitlines():
         line = line.strip()
         if line.startswith("HEAD branch:"):
             return line.split(":", 1)[1].strip()
 
-    # Conservative fallback
     return "main"
 
 
-def list_local_branches_with_upstream(cwd: str) -> List[BranchInfo]:
+def git_get_default_branch_local(cwd: str, remote: str) -> str:
     """
-    Return local branches that have upstream configured.
-    Uses tab-separated fields:
-      branch_name  upstream_short  head_sha
+    Determine default branch (local name) by asking origin/HEAD, falling back to remote show.
     """
+    ref = run(
+        ["git", "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"],
+        cwd=cwd,
+        check=False,
+    )
+    out = ""
+    if not ref:
+        out = run(["git", "remote", "show", remote], cwd=cwd, check=False)
+
+    return git_parse_default_branch(remote, ref, out)
+
+
+def git_list_all_local_branches(cwd: str) -> List[BranchInfo]:
+    """Return all local branches."""
     fmt = "%(refname:short)\t%(upstream:short)\t%(objectname)"
     out = run(["git", "for-each-ref", f"--format={fmt}", "refs/heads"], cwd=cwd)
     branches: List[BranchInfo] = []
@@ -130,33 +155,23 @@ def list_local_branches_with_upstream(cwd: str) -> List[BranchInfo]:
         if len(parts) != 3:
             continue
         name, upstream, sha = (p.strip() for p in parts)
-        if upstream:
-            branches.append(BranchInfo(name=name, upstream=upstream, head_sha=sha))
+        # Even if upstream is empty, we include it for fuzzy matching
+        branches.append(BranchInfo(name=name, upstream=upstream or "-", head_sha=sha))
     return branches
 
 
-def upstream_remote_and_branch(upstream_short: str) -> Tuple[str, str]:
-    """
-    Upstream is typically like "origin/feature-branch".
-    Returns (remote, branch).
-    """
+def git_upstream_remote_and_branch(upstream_short: str) -> Tuple[str, str]:
+    """Upstream is like 'origin/feature-branch'. Returns (remote, branch)."""
     if "/" not in upstream_short:
-        # Extremely unusual, but handle
         return ("origin", upstream_short)
     remote, branch = upstream_short.split("/", 1)
     return remote, branch
 
 
-def get_all_remote_branches(cwd: str, remote: str) -> set[str]:
-    """
-    Fetch all branch names existing on the remote in one call.
-    Returns a set of branch names (e.g. {'main', 'feature-1'}).
-    """
-    print(f"--> Batch call: Fetching all remote branches for '{remote}' via ls-remote...")
-    out = run(["git", "ls-remote", "--heads", remote], cwd=cwd, check=True)
+def git_parse_ls_remote(output: str) -> set[str]:
+    """Pure function to parse git ls-remote output."""
     branches = set()
-    for line in out.splitlines():
-        # Output format: "<sha>\trefs/heads/<branchname>"
+    for line in output.splitlines():
         if "\t" in line:
             ref = line.split("\t", 1)[1]
             if ref.startswith("refs/heads/"):
@@ -164,17 +179,31 @@ def get_all_remote_branches(cwd: str, remote: str) -> set[str]:
     return branches
 
 
+def git_get_all_remote_branches(cwd: str, remote: str) -> set[str]:
+    """Fetch all branch names existing on the remote."""
+    print(
+        f"--> Batch call: Fetching all remote branches for '{remote}' via ls-remote..."
+    )
+    out = run(["git", "ls-remote", "--heads", remote], cwd=cwd, check=True)
+    return git_parse_ls_remote(out)
+
+
 def gh_repo_owner_and_name(cwd: str) -> str:
     """
     Return "OWNER/REPO" via gh.
     """
-    out = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], cwd=cwd)
+    out = run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        cwd=cwd,
+    )
     if not out or "/" not in out:
         raise RuntimeError("Could not determine repo nameWithOwner via `gh repo view`.")
     return out.strip()
 
 
-def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str, cache_dir: Path) -> List[PRInfo]:
+def gh_prs_associated_with_commit(
+    cwd: str, owner_repo: str, sha: str, cache_dir: Path
+) -> List[PRInfo]:
     """
     Use GitHub API via gh to list PRs associated with a commit:
       GET /repos/{owner}/{repo}/commits/{ref}/pulls
@@ -219,7 +248,9 @@ def gh_prs_associated_with_commit(cwd: str, owner_repo: str, sha: str, cache_dir
                 url=str(item.get("html_url") or ""),
                 merged_at=item.get("merged_at"),
                 head_ref=(item.get("head") or {}).get("ref"),
-                head_owner=((item.get("head") or {}).get("repo") or {}).get("owner", {}).get("login"),
+                head_owner=((item.get("head") or {}).get("repo") or {})
+                .get("owner", {})
+                .get("login"),
             )
         )
 
@@ -245,26 +276,31 @@ def gh_fetch_all_prs(cwd: str, cache_dir: Path) -> Dict[str, PRInfo]:
             continue
 
     print("--> Updating PR cache from GitHub...")
-    
-    # We use a large limit per page. 'gh' handles some pagination but 
+
+    # We use a large limit per page. 'gh' handles some pagination but
     # we may need multiple calls if the repo is very large.
     limit = 100
     page = 1
-    
+
     # Mapping to return
     # We build this at the end from the full cache to ensure correct ordering (newest wins)
-    
+
     while True:
         # We sort by updated so we see changes to old PRs (like closing/merging)
         out = run(
             [
-                "gh", "pr", "list",
-                "--state", "all",
-                "--limit", str(limit),
-                # This is tricky: gh doesn't expose a simple way to get 'page 2' of the list 
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                str(limit),
+                # This is tricky: gh doesn't expose a simple way to get 'page 2' of the list
                 # without using search or graphql. However, for most repos, 300-500 is plenty.
                 # We'll fetch 100 at a time and manually stop if we see no changes.
-                "--json", "number,state,title,url,mergedAt,headRefName,headRepositoryOwner",
+                "--json",
+                "number,state,title,url,mergedAt,headRefName,headRepositoryOwner",
             ],
             cwd=cwd,
         )
@@ -284,26 +320,26 @@ def gh_fetch_all_prs(cwd: str, cache_dir: Path) -> Dict[str, PRInfo]:
                 head_ref=item.get("headRefName"),
                 head_owner=(item.get("headRepositoryOwner") or {}).get("login"),
             )
-            
+
             cached = cached_prs.get(num)
             if cached != current:
                 # Update cache
                 (pr_cache_dir / f"{num}.json").write_text(json.dumps(asdict(current)))
                 cached_prs[num] = current
                 new_or_updated += 1
-        
+
         # If we didn't find any new/updated PRs in this page, we can likely stop.
         # Note: If we need more than 100, we'd need to use --search or gh api.
         # For now, we fetch up to 1000 total or until cache is stable.
         if new_or_updated == 0 or page >= 10:
             break
-            
-        # Optimization: since 'gh pr list' doesn't easily paginate beyond limit, 
+
+        # Optimization: since 'gh pr list' doesn't easily paginate beyond limit,
         # we increase limit for the next 'page' to see deeper history if needed.
         limit += 100
         page += 1
 
-    # Index by head_ref. Since results were fetched in updated order, 
+    # Index by head_ref. Since results were fetched in updated order,
     # the first one we see for a ref is the "most relevant".
     # Sort cached_prs by number descending before indexing.
     indexed: Dict[str, PRInfo] = {}
@@ -312,8 +348,6 @@ def gh_fetch_all_prs(cwd: str, cache_dir: Path) -> Dict[str, PRInfo]:
         if pr.head_ref and pr.head_ref not in indexed:
             indexed[pr.head_ref] = pr
     return indexed
-
-
 
 
 def iso_to_short(iso: Optional[str]) -> str:
@@ -336,7 +370,47 @@ def get_cache_dir(owner_repo: str) -> Path:
     return path
 
 
-def classify_branches(cwd: str, remote: str, default_branch: str, branches: List[BranchInfo]) -> List[Classified]:
+def git_get_fuzzy_match(
+    cwd: str, branch: str, default_branch: str
+) -> Optional[FuzzyMatch]:
+    """
+    Compare commit subject lines of branch vs default branch since their merge-base.
+    Useful for detecting rebased/squashed branches that didn't use a PR.
+    """
+    base = run(["git", "merge-base", default_branch, branch], cwd=cwd, check=False)
+    if not base:
+        return None
+
+    # Commits on branch not in default
+    branch_commits = run(
+        ["git", "log", f"{base}..{branch}", "--format=%s"], cwd=cwd, check=False
+    ).splitlines()
+    branch_commits = [c.strip() for c in branch_commits if c.strip()]
+    if not branch_commits:
+        return None
+
+    # Filter out single-word commits unless it's the only commit
+    if len(branch_commits) > 1:
+        branch_commits = [c for c in branch_commits if len(c.split()) > 1]
+        if not branch_commits:
+            return None
+
+    # Commits on default since base
+    default_commits = set(
+        run(
+            ["git", "log", f"{base}..{default_branch}", "--format=%s"],
+            cwd=cwd,
+            check=False,
+        ).splitlines()
+    )
+
+    matched = sum(1 for c in branch_commits if c in default_commits)
+    return FuzzyMatch(matched=matched, total=len(branch_commits))
+
+
+def gh_classify_branches(
+    cwd: str, remote: str, default_branch: str, branches: List[BranchInfo]
+) -> List[Classified]:
     owner_repo = gh_repo_owner_and_name(cwd)
     cache_dir = get_cache_dir(owner_repo)
 
@@ -348,20 +422,32 @@ def classify_branches(cwd: str, remote: str, default_branch: str, branches: List
 
     classified: List[Classified] = []
     target_branches = [b for b in branches if b.name != default_branch]
-    
+
     for b in tqdm(target_branches, desc="Classifying branches", unit="branch"):
-        up_remote, up_branch = upstream_remote_and_branch(b.upstream)
+        up_remote, up_branch = git_upstream_remote_and_branch(b.upstream)
 
         # Simplified logic for foreign remotes
-        if up_remote != remote:
+        if up_remote != "-" and up_remote != remote:
             upstream_sha = run(["git", "rev-parse", b.upstream], cwd=cwd, check=False)
-            note = f"Foreign remote ({up_remote}); matches locally cached upstream." if b.head_sha == upstream_sha else f"Foreign remote ({up_remote}); changes vs cached upstream."
-            classified.append(Classified(branch=b, remote_exists=True, pr=None, note=note, is_version_branch=is_version_branch_name(b.name)))
+            note = (
+                f"Foreign remote ({up_remote}); matches locally cached upstream."
+                if b.head_sha == upstream_sha
+                else f"Foreign remote ({up_remote}); changes vs cached upstream."
+            )
+            classified.append(
+                Classified(
+                    branch=b,
+                    remote_exists=True,
+                    pr=None,
+                    note=note,
+                    is_version_branch=is_version_branch_name(b.name),
+                )
+            )
             continue
 
         # Check remote existence
         if up_remote not in remote_heads_cache:
-            remote_heads_cache[up_remote] = get_all_remote_branches(cwd, up_remote)
+            remote_heads_cache[up_remote] = git_get_all_remote_branches(cwd, up_remote)
         exists = up_branch in remote_heads_cache[up_remote]
 
         # PR Matching Strategy:
@@ -385,19 +471,30 @@ def classify_branches(cwd: str, remote: str, default_branch: str, branches: List
         if not exists and pr and (pr.merged_at or pr.state == "MERGED"):
             note += " Upstream branch removed."
 
+        fuzzy = None
+        if not pr:
+            fuzzy = git_get_fuzzy_match(cwd, b.name, default_branch)
+            if fuzzy and fuzzy.matched > 0:
+                note = f"Fuzzy matched {fuzzy.ratio_str} commits in {default_branch}."
+
         # Final classification (calculated every time, not cached)
-        classified.append(Classified(
-            branch=b,
-            remote_exists=exists,
-            pr=pr,
-            note=note,
-            is_version_branch=is_version_branch_name(b.name)
-        ))
+        classified.append(
+            Classified(
+                branch=b,
+                remote_exists=exists,
+                pr=pr,
+                note=note,
+                is_version_branch=is_version_branch_name(b.name),
+                fuzzy_match=fuzzy,
+            )
+        )
 
     return classified
 
 
-def print_group(title: str, items: List[Classified], verbose: bool = False, skip_empty: bool = False) -> None:
+def print_group(
+    title: str, items: List[Classified], verbose: bool = False, skip_empty: bool = False
+) -> None:
     if not items:
         if skip_empty:
             return
@@ -421,9 +518,13 @@ def print_group(title: str, items: List[Classified], verbose: bool = False, skip
         if len(branch_display) > 40:
             branch_display = branch_display[:37] + "..."
 
+        pr_col = f"#{pr.number}" if pr else "-"
+        if not pr and it.fuzzy_match:
+            pr_col = f"Fuzzy:{it.fuzzy_match.ratio_str}"
+
         row = [
             branch_display,
-            f"#{pr.number}" if pr else "-",
+            pr_col,
             iso_to_short(pr.merged_at) if pr else "-",
             pr.url if pr else "-",
         ]
@@ -455,11 +556,6 @@ def main() -> int:
         help="Remote name used to determine default branch (default: origin).",
     )
     ap.add_argument(
-        "--include-no-upstream",
-        action="store_true",
-        help="Also include local branches without upstream (not recommended; default: only branches with upstream).",
-    )
-    ap.add_argument(
         "--verbose",
         action="store_true",
         help="Show Note column and Version Number Branches section.",
@@ -469,11 +565,19 @@ def main() -> int:
         action="store_true",
         help="Actually delete branches (local and remote where appropriate).",
     )
+    ap.add_argument(
+        "--partials",
+        action="store_true",
+        help="Include partial fuzzy-matched branches in cleanup.",
+    )
     args = ap.parse_args()
 
     cwd = os.getcwd()
-    if not is_git_repo(cwd):
-        print("Error: current directory does not appear to be a git repository.", file=sys.stderr)
+    if not git_is_repo(cwd):
+        print(
+            "Error: current directory does not appear to be a git repository.",
+            file=sys.stderr,
+        )
         return 2
 
     # Verify tools exist / usable
@@ -492,23 +596,10 @@ def main() -> int:
     # Check gh auth quickly; if not logged in, gh commands will error later.
     _ = run(["gh", "auth", "status"], cwd=cwd, check=False)
 
-    default_branch = get_default_branch_local(cwd, args.remote)
-    branches = list_local_branches_with_upstream(cwd)
+    default_branch = git_get_default_branch_local(cwd, args.remote)
+    branches = git_list_all_local_branches(cwd)
 
-    # Optionally include no-upstream branches (not requested by default)
-    if args.include_no_upstream:
-        # Add branches lacking upstream too (best-effort). They will have upstream="-" and won't be checked meaningfully.
-        fmt = "%(refname:short)\t%(upstream:short)\t%(objectname)"
-        out = run(["git", "for-each-ref", f"--format={fmt}", "refs/heads"], cwd=cwd)
-        all_branches: List[BranchInfo] = []
-        for line in out.splitlines():
-            if not line.strip():
-                continue
-            name, upstream, sha = (p.strip() for p in line.split("\t", 2))
-            all_branches.append(BranchInfo(name=name, upstream=upstream or "-", head_sha=sha))
-        branches = all_branches
-
-    classified = classify_branches(cwd, args.remote, default_branch, branches)
+    classified = gh_classify_branches(cwd, args.remote, default_branch, branches)
 
     active: List[Classified] = []
     merged_remote_exists: List[Classified] = []
@@ -516,14 +607,16 @@ def main() -> int:
     version_branches: List[Classified] = []
     foreign_matching: List[Classified] = []
     foreign_local_changes: List[Classified] = []
+    fuzzy_full: List[Classified] = []
+    fuzzy_partial: List[Classified] = []
     other: List[Classified] = []
 
     for it in classified:
-        up_remote, _ = upstream_remote_and_branch(it.branch.upstream)
-        
+        up_remote, _ = git_upstream_remote_and_branch(it.branch.upstream)
+
         if it.is_version_branch:
             version_branches.append(it)
-        elif up_remote != args.remote:
+        elif up_remote != "-" and up_remote != args.remote:
             if "matches" in it.note:
                 foreign_matching.append(it)
             else:
@@ -535,24 +628,68 @@ def main() -> int:
                 merged_remote_exists.append(it)
             else:
                 merged_remote_missing.append(it)
+        elif it.fuzzy_match:
+            if it.fuzzy_match.matched == it.fuzzy_match.total:
+                fuzzy_full.append(it)
+            elif it.fuzzy_match.matched > 0:
+                fuzzy_partial.append(it)
+            else:
+                other.append(it)
+
         else:
             # Includes: no PR found, or closed/unmerged
             other.append(it)
 
+    # Sort fuzzy matches by percentage descending
+    fuzzy_full.sort(key=lambda x: x.fuzzy_match.match_percentage, reverse=True)
+    fuzzy_partial.sort(key=lambda x: x.fuzzy_match.match_percentage, reverse=True)
+
     print(f"Default branch (set aside): {default_branch}")
-    print(f"Scanned branches (with upstreams): {len([b for b in branches if b.upstream and b.upstream != '-'])}")
+    print(f"Scanned local branches: {len(branches)}")
 
     # Branches to remove
-    to_remove = foreign_matching + merged_remote_exists + merged_remote_missing
+    to_remove = (
+        foreign_matching + merged_remote_exists + merged_remote_missing + fuzzy_full
+    )
+    if args.partials:
+        to_remove += fuzzy_partial
 
     if not to_remove:
-        print("\nNo branches found for cleanup (merged PRs or matching foreign remotes).")
+        print(
+            "\nNo branches found for cleanup (merged PRs or matching foreign remotes)."
+        )
     else:
         if foreign_matching:
-            print_group(f"Foreign Remote (Matches Upstream) [Remotes != {args.remote}]", foreign_matching, verbose=args.verbose)
+            print_group(
+                f"Foreign Remote (Matches Upstream) [Remotes != {args.remote}]",
+                foreign_matching,
+                verbose=args.verbose,
+            )
 
-        print_group("Pull request committed (MERGED) and remote branch still exists (cleanup remote + local candidates)", merged_remote_exists, verbose=args.verbose, skip_empty=True)
-        print_group("Pull request committed (MERGED) and remote branch removed (cleanup local candidates)", merged_remote_missing, verbose=args.verbose, skip_empty=True)
+        print_group(
+            "Pull request committed (MERGED) and remote branch still exists (cleanup remote + local candidates)",
+            merged_remote_exists,
+            verbose=args.verbose,
+            skip_empty=True,
+        )
+        print_group(
+            "Pull request committed (MERGED) and remote branch removed (cleanup local candidates)",
+            merged_remote_missing,
+            verbose=args.verbose,
+            skip_empty=True,
+        )
+        print_group(
+            f"Fuzzy Matched: All commits found in {default_branch} (cleanup local candidates)",
+            fuzzy_full,
+            verbose=args.verbose,
+            skip_empty=True,
+        )
+        print_group(
+            f"Fuzzy Matched: Some commits found in {default_branch} (cleanup with --partials)",
+            fuzzy_partial,
+            verbose=args.verbose,
+            skip_empty=True,
+        )
 
     if args.cleanup and to_remove:
         print("\n--> Starting Cleanup...")
@@ -563,14 +700,18 @@ def main() -> int:
 
         # 2. Merged, remote exists
         for it in merged_remote_exists:
-            _, up_branch = upstream_remote_and_branch(it.branch.upstream)
+            _, up_branch = git_upstream_remote_and_branch(it.branch.upstream)
             print(f"Deleting remote branch: {args.remote}/{up_branch}")
             run(["git", "push", args.remote, "--delete", up_branch], cwd=cwd)
             print(f"Deleting local branch: {it.branch.name}")
             run(["git", "branch", "-D", it.branch.name], cwd=cwd)
 
-        # 3. Merged, remote missing
-        for it in merged_remote_missing:
+        # 3. Merged, remote missing, or fuzzy matches
+        for it in (
+            merged_remote_missing
+            + fuzzy_full
+            + (fuzzy_partial if args.partials else [])
+        ):
             print(f"Deleting local branch: {it.branch.name}")
             run(["git", "branch", "-D", it.branch.name], cwd=cwd)
         print("Cleanup complete.")
@@ -585,12 +726,20 @@ def main() -> int:
             print(f"\nVersion Number Branches (ignored for PR cleanup): {vb_names}")
 
         if foreign_local_changes:
-            print_group(f"Foreign Remote (Has Local Changes) [Remotes != {args.remote}]", foreign_local_changes, verbose=args.verbose)
+            print_group(
+                f"Foreign Remote (Has Local Changes) [Remotes != {args.remote}]",
+                foreign_local_changes,
+                verbose=args.verbose,
+            )
 
         print_group("Pull request still active (OPEN)", active, verbose=args.verbose)
 
         if other:
-            print_group("Other / Unresolved (no PR match, or CLOSED but not merged, etc.)", other, verbose=args.verbose)
+            print_group(
+                "Other / Unresolved (no PR match, or CLOSED but not merged, etc.)",
+                other,
+                verbose=args.verbose,
+            )
 
     return 0
 

@@ -41,7 +41,7 @@ uv run PATH/TO/gh_audit.py
 | `--remote NAME` | Remote name to use (default: `origin`) |
 | `--verbose` | Show detailed notes and version number branches |
 | `--cleanup` | Actually delete branches (use with caution!) |
-| `--include-no-upstream` | Include local branches without upstream tracking |
+| `--partials` | Include partial fuzzy-matched branches in cleanup |
 
 ## Output Categories
 
@@ -52,6 +52,8 @@ The tool classifies branches into several categories:
 - **Merged + Remote Exists**: PR was merged but the remote branch still exists. Cleanup will delete both remote and local branches.
 - **Merged + Remote Missing**: PR was merged and remote branch was already deleted. Cleanup will delete the local branch.
 - **Foreign Remote (Matches Upstream)**: Branches tracking a different remote that match their upstream. Safe to delete locally.
+- **Fuzzy Matched (Full)**: Local branches where all commits since the merge-base appear in the default branch's history by subject line. Common for rebased/squashed work.
+- **Fuzzy Matched (Partial)**: Some, but not all, commits appear in the default branch. Only removed if `--partials` is used.
 
 ### Retained Branches (shown with `--verbose`)
 
