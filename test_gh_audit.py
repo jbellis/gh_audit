@@ -12,6 +12,7 @@ from gh_audit import (
 
 
 def test_fuzzy_match_dataclass():
+    # FuzzyMatch represents matches/total_hunks_or_commits
     fm = FuzzyMatch(matched=2, total=3)
     assert fm.ratio_str == "2/3"
     assert round(fm.match_percentage, 2) == 66.67

@@ -30,11 +30,13 @@ import re
 import shlex
 import subprocess
 import sys
-from tqdm import tqdm
-from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from tqdm import tqdm
 
 
 @dataclass(frozen=True)
@@ -370,33 +372,80 @@ def get_cache_dir(owner_repo: str) -> Path:
     return path
 
 
+def _check_hunk_in_default(
+    cwd: str, default_branch: str, sha: str, fname: str
+) -> Optional[bool]:
+    """
+    Check if the first hunk of additions for a file in a commit exists in default branch.
+    Returns True if found, False if not found, None if no hunk to check.
+    """
+    # Get the first hunk of additions for this file in this commit
+    # -U0 means no context.
+    diff = run(
+        ["git", "show", "-U0", "--format=", sha, "--", fname],
+        cwd=cwd,
+        check=False,
+    )
+
+    # Extract the first block of lines starting with '+' (excluding '+++')
+    hunk_lines = []
+    for dline in diff.splitlines():
+        if dline.startswith("+++") or dline.startswith("---"):
+            continue
+        if dline.startswith("+"):
+            hunk_lines.append(dline[1:])
+        elif hunk_lines:
+            # We found the end of the first contiguous '+' block
+            break
+
+    if not hunk_lines:
+        return None
+
+    hunk_str = "\n".join(hunk_lines)
+
+    # Check if this hunk_str exists in default_branch HEAD version of fname
+    file_content = run(
+        ["git", "cat-file", "-p", f"{default_branch}:{fname}"],
+        cwd=cwd,
+        check=False,
+    )
+    return hunk_str in file_content
+
+
 def git_get_fuzzy_match(
     cwd: str, branch: str, default_branch: str
 ) -> Optional[FuzzyMatch]:
     """
-    Compare commit subject lines of branch vs default branch since their merge-base.
-    Useful for detecting rebased/squashed branches that didn't use a PR.
+    Compare branch vs default branch since their merge-base.
+    Strategy:
+    1. Count commits whose subject lines match exactly.
+    2. For commits that don't match by subject, look at the first diff hunk in each file.
+    3. Check if that multiline hunk exists in the default branch's HEAD.
+    Score is N/M where M is number of hunks/subjects examined, N is matches.
+
+    Hunk checks are parallelized with a thread pool.
     """
     base = run(["git", "merge-base", default_branch, branch], cwd=cwd, check=False)
     if not base:
         return None
 
-    # Commits on branch not in default
-    branch_commits = run(
-        ["git", "log", f"{base}..{branch}", "--format=%s"], cwd=cwd, check=False
-    ).splitlines()
-    branch_commits = [c.strip() for c in branch_commits if c.strip()]
+    # Commits on branch not in default (SHA and Subject)
+    out = run(
+        ["git", "log", f"{base}..{branch}", "--format=%H %s"], cwd=cwd, check=False
+    )
+    branch_commits = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            branch_commits.append((parts[0], parts[1]))
+
     if not branch_commits:
         return None
 
-    # Filter out single-word commits unless it's the only commit
-    if len(branch_commits) > 1:
-        branch_commits = [c for c in branch_commits if len(c.split()) > 1]
-        if not branch_commits:
-            return None
-
     # Commits on default since base
-    default_commits = set(
+    default_subjects = set(
         run(
             ["git", "log", f"{base}..{default_branch}", "--format=%s"],
             cwd=cwd,
@@ -404,8 +453,49 @@ def git_get_fuzzy_match(
         ).splitlines()
     )
 
-    matched = sum(1 for c in branch_commits if c in default_commits)
-    return FuzzyMatch(matched=matched, total=len(branch_commits))
+    matched = 0
+    total_checks = 0
+
+    # First pass: count subject matches and collect hunk check tasks
+    hunk_tasks: List[Tuple[str, str]] = []  # (sha, fname)
+
+    for sha, subject in branch_commits:
+        if subject in default_subjects:
+            matched += 1
+            total_checks += 1
+            continue
+
+        # Subject didn't match. Collect files for hunk checking.
+        files = run(
+            ["git", "show", "--name-only", "--format=", sha], cwd=cwd, check=False
+        ).splitlines()
+        files = [f.strip() for f in files if f.strip()]
+
+        for fname in files:
+            hunk_tasks.append((sha, fname))
+
+    # Parallel hunk evaluation
+    if hunk_tasks:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(
+                    _check_hunk_in_default, cwd, default_branch, sha, fname
+                ): (sha, fname)
+                for sha, fname in hunk_tasks
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    # No hunk to check for this file
+                    continue
+                total_checks += 1
+                if result:
+                    matched += 1
+
+    if total_checks == 0:
+        return None
+
+    return FuzzyMatch(matched=matched, total=total_checks)
 
 
 def gh_classify_branches(
