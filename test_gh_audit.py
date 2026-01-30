@@ -30,6 +30,7 @@ def test_git_upstream_remote_and_branch():
 def test_is_version_branch_name():
     assert is_version_branch_name("0.1-beta") is True
     assert is_version_branch_name("1.2.3") is True
+    assert is_version_branch_name("0.15.0") is True
     assert is_version_branch_name("feature-branch") is False
 
 

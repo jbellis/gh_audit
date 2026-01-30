@@ -147,16 +147,21 @@ def git_get_default_branch_local(cwd: str, remote: str) -> str:
 
 def git_list_all_local_branches(cwd: str) -> List[BranchInfo]:
     """Return all local branches."""
-    fmt = "%(refname:short)\t%(upstream:short)\t%(objectname)"
+    # We use %(refname) instead of %(refname:short) to avoid 'heads/' prefixes
+    # that Git adds when a branch name is ambiguous (e.g. also exists as a tag).
+    fmt = "%(refname)\t%(upstream:short)\t%(objectname)"
     out = run(["git", "for-each-ref", f"--format={fmt}", "refs/heads"], cwd=cwd)
     branches: List[BranchInfo] = []
+    prefix = "refs/heads/"
     for line in out.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
         if len(parts) != 3:
             continue
-        name, upstream, sha = (p.strip() for p in parts)
+        refname, upstream, sha = (p.strip() for p in parts)
+        # Strip refs/heads/ to get the actual branch name
+        name = refname[len(prefix) :] if refname.startswith(prefix) else refname
         # Even if upstream is empty, we include it for fuzzy matching
         branches.append(BranchInfo(name=name, upstream=upstream or "-", head_sha=sha))
     return branches
