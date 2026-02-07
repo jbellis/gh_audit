@@ -83,6 +83,23 @@ class Classified:
     fuzzy_match: Optional[FuzzyMatch] = None
 
 
+@dataclass(frozen=True)
+class WorktreeInfo:
+    path: str
+    head_sha: str
+    branch_ref: Optional[str]
+    locked: bool = False
+
+    @property
+    def branch_name(self) -> Optional[str]:
+        if not self.branch_ref:
+            return None
+        prefix = "refs/heads/"
+        if self.branch_ref.startswith(prefix):
+            return self.branch_ref[len(prefix) :]
+        return None
+
+
 def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> str:
     """Run a command and return stdout text (stripped)."""
     try:
@@ -184,6 +201,92 @@ def git_parse_ls_remote(output: str) -> set[str]:
             if ref.startswith("refs/heads/"):
                 branches.add(ref[len("refs/heads/") :])
     return branches
+
+
+def git_parse_worktree_list_porcelain(output: str) -> List[WorktreeInfo]:
+    """Pure function to parse `git worktree list --porcelain` output."""
+    worktrees: List[WorktreeInfo] = []
+    current: Optional[dict] = None
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        worktrees.append(
+            WorktreeInfo(
+                path=str(current.get("path") or ""),
+                head_sha=str(current.get("head_sha") or ""),
+                branch_ref=current.get("branch_ref"),
+                locked=bool(current.get("locked") or False),
+            )
+        )
+        current = None
+
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith("worktree "):
+            flush()
+            current = {
+                "path": line.split(" ", 1)[1].strip(),
+                "head_sha": "",
+                "branch_ref": None,
+                "locked": False,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if line.startswith("HEAD "):
+            current["head_sha"] = line.split(" ", 1)[1].strip()
+        elif line.startswith("branch "):
+            current["branch_ref"] = line.split(" ", 1)[1].strip()
+        elif line == "detached":
+            current["branch_ref"] = None
+        elif line == "locked":
+            current["locked"] = True
+
+    flush()
+    return worktrees
+
+
+def git_list_worktrees(cwd: str) -> List[WorktreeInfo]:
+    out = run(["git", "worktree", "list", "--porcelain"], cwd=cwd, check=True)
+    return git_parse_worktree_list_porcelain(out)
+
+
+def git_current_branch(cwd: str) -> Optional[str]:
+    out = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd, check=True).strip()
+    if not out or out == "HEAD":
+        return None
+    return out
+
+
+def git_prepare_branch_deletion(cwd: str, default_branch: str, branch_name: str) -> None:
+    current = git_current_branch(cwd)
+    if current == branch_name:
+        run(["git", "checkout", default_branch], cwd=cwd, check=True)
+
+    main_path = Path(cwd).resolve()
+
+    for wt in git_list_worktrees(cwd):
+        if wt.branch_name != branch_name:
+            continue
+
+        wt_path = Path(wt.path).resolve()
+        if wt_path == main_path:
+            continue
+
+        if wt.locked:
+            run(["git", "worktree", "unlock", wt.path], cwd=cwd, check=False)
+
+        try:
+            run(["git", "worktree", "remove", wt.path], cwd=cwd, check=True)
+        except RuntimeError:
+            run(["git", "worktree", "remove", "--force", wt.path], cwd=cwd, check=True)
 
 
 def git_get_all_remote_branches(cwd: str, remote: str) -> set[str]:
@@ -790,6 +893,7 @@ def main() -> int:
         print("\n--> Starting Cleanup...")
         # 1. Foreign matching
         for it in foreign_matching:
+            git_prepare_branch_deletion(cwd, default_branch, it.branch.name)
             print(f"Deleting local branch: {it.branch.name}")
             run(["git", "branch", "-D", it.branch.name], cwd=cwd)
 
@@ -798,6 +902,8 @@ def main() -> int:
             _, up_branch = git_upstream_remote_and_branch(it.branch.upstream)
             print(f"Deleting remote branch: {args.remote}/{up_branch}")
             run(["git", "push", args.remote, "--delete", up_branch], cwd=cwd)
+
+            git_prepare_branch_deletion(cwd, default_branch, it.branch.name)
             print(f"Deleting local branch: {it.branch.name}")
             run(["git", "branch", "-D", it.branch.name], cwd=cwd)
 
@@ -807,6 +913,7 @@ def main() -> int:
             + fuzzy_full
             + (fuzzy_partial if args.partials else [])
         ):
+            git_prepare_branch_deletion(cwd, default_branch, it.branch.name)
             print(f"Deleting local branch: {it.branch.name}")
             run(["git", "branch", "-D", it.branch.name], cwd=cwd)
         print("Cleanup complete.")
